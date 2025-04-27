@@ -19,12 +19,14 @@ import com.alibaba.fastjson.JSON;
 import com.alibaba.fastjson.JSONException;
 import com.alibaba.fastjson.JSONObject;
 import com.alibaba.fastjson.serializer.SerializerFeature;
+import io.seata.common.util.CollectionUtils;
 import io.seata.core.context.RootContext;
 import org.apache.http.HttpResponse;
 import org.apache.http.HttpStatus;
 import org.apache.http.client.methods.CloseableHttpResponse;
 import org.apache.http.client.methods.HttpGet;
 import org.apache.http.client.methods.HttpPost;
+import org.apache.http.client.methods.HttpPut;
 import org.apache.http.client.methods.HttpUriRequest;
 import org.apache.http.entity.ContentType;
 import org.apache.http.entity.StringEntity;
@@ -37,7 +39,6 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.stream.Collectors;
 
 /**
  * Abstract http executor.
@@ -50,13 +51,35 @@ public abstract class AbstractHttpExecutor implements HttpExecutor {
 
     @Override
     public <T, K> K executePost(String host, String path, T paramObject, Class<K> returnType) throws IOException {
-
         Args.notNull(returnType, "returnType");
+        HttpPost httpPost = new HttpPost(host + path);
+        StringEntity entity = execute(host, path, paramObject);
+        if (entity != null) {
+            httpPost.setEntity(entity);
+        }
+        Map<String, String> headers = new HashMap<>();
+        buildPostHeaders(headers, paramObject);
+        CloseableHttpClient httpClient = initHttpClientInstance(paramObject);
+        return wrapHttpExecute(returnType, httpClient, httpPost, headers);
+    }
+
+    @Override
+    public <T, K> K executePut(String host, String path, T paramObject, Class<K> returnType) throws IOException {
+        Args.notNull(returnType, "returnType");
+        HttpPut httpPut = new HttpPut(host + path);
+        StringEntity entity = execute(host, path, paramObject);
+        if (entity != null) {
+            httpPut.setEntity(entity);
+        }
+        Map<String, String> headers = new HashMap<>();
+        buildPostHeaders(headers, paramObject);
+        CloseableHttpClient httpClient = initHttpClientInstance(paramObject);
+        return wrapHttpExecute(returnType, httpClient, httpPut, headers);
+    }
+
+    private <T> StringEntity execute(String host, String path, T paramObject) {
         Args.notNull(host, "host");
         Args.notNull(path, "path");
-
-        CloseableHttpClient httpClient = initHttpClientInstance(paramObject);
-        HttpPost httpPost = new HttpPost(host + path);
         StringEntity entity = null;
         if (paramObject != null) {
             String content;
@@ -80,14 +103,7 @@ public abstract class AbstractHttpExecutor implements HttpExecutor {
             entity = new StringEntity(content, ContentType.APPLICATION_JSON);
         }
 
-        entity = buildEntity(entity, paramObject);
-        if (entity != null) {
-            httpPost.setEntity(entity);
-        }
-        Map<String, String> headers = new HashMap<>();
-
-        buildPostHeaders(headers, paramObject);
-        return wrapHttpExecute(returnType, httpClient, httpPost, headers);
+        return buildEntity(entity, paramObject);
     }
 
     @Override
@@ -114,14 +130,15 @@ public abstract class AbstractHttpExecutor implements HttpExecutor {
 
     protected abstract <T> void buildClientEntity(CloseableHttpClient httpClient, T paramObject);
 
-    private <K> K wrapHttpExecute(Class<K> returnType, CloseableHttpClient httpClient, HttpUriRequest httpUriRequest, Map<String, String> headers) throws IOException {
+    private <K> K wrapHttpExecute(Class<K> returnType, CloseableHttpClient httpClient, HttpUriRequest httpUriRequest,
+                                  Map<String, String> headers) throws IOException {
         CloseableHttpResponse response;
         String xid = RootContext.getXID();
         if (xid != null) {
             headers.put(RootContext.KEY_XID, xid);
         }
         if (!headers.isEmpty()) {
-            headers.keySet().forEach(key -> httpUriRequest.addHeader(key, headers.get(key)));
+            headers.forEach(httpUriRequest::addHeader);
         }
         response = httpClient.execute(httpUriRequest);
         int statusCode = response.getStatusLine().getStatusCode();
@@ -148,14 +165,11 @@ public abstract class AbstractHttpExecutor implements HttpExecutor {
 
 
     public static Map<String, String> convertParamOfBean(Object sourceParam) {
-        return convert(JSON.parseObject(JSON.toJSONString(sourceParam, SerializerFeature.WriteNullStringAsEmpty, SerializerFeature.WriteMapNullValue), Map.class));
+        return CollectionUtils.toStringMap(JSON.parseObject(JSON.toJSONString(sourceParam, SerializerFeature.WriteNullStringAsEmpty, SerializerFeature.WriteMapNullValue), Map.class));
     }
 
-    public static <T> Map<String, String> convertParamOfJsonString(String jsonstr, Class<T> returnType) {
-        return convertParamOfBean(JSON.parseObject(jsonstr, returnType));
-    }
-
-    public static Map<String, String> convert(Map<String, Object> param) {
-        return param.keySet().stream().filter(key -> param.get(key) != null && param.get(key) != null).collect(Collectors.toMap(key -> key, key -> param.get(key).toString()));
+    @SuppressWarnings("lgtm[java/unsafe-deserialization]")
+    public static <T> Map<String, String> convertParamOfJsonString(String jsonStr, Class<T> returnType) {
+        return convertParamOfBean(JSON.parseObject(jsonStr, returnType));
     }
 }

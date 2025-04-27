@@ -29,6 +29,8 @@ import io.seata.saga.engine.strategy.StatusDecisionStrategy;
 import io.seata.saga.proctrl.eventing.impl.ProcessCtrlEventPublisher;
 import org.springframework.context.ApplicationContext;
 
+import javax.script.ScriptEngineManager;
+
 /**
  * StateMachineConfig
  *
@@ -144,19 +146,26 @@ public interface StateMachineConfig {
     /**
      * get ServiceInvokerManager
      *
-     * @return
+     * @return the service invoker manager info
      */
     ServiceInvokerManager getServiceInvokerManager();
 
     /**
      * get trans operation timeout
-     * @return
+     * @return the transaction operate time out
      */
     int getTransOperationTimeout();
 
     /**
      * get service invoke timeout
-     * @return
+     * @return the service invoke time out
      */
     int getServiceInvokeTimeout();
+
+    /**
+     * get ScriptEngineManager
+     *
+     * @return the script engine manager info
+     */
+    ScriptEngineManager getScriptEngineManager();
 }

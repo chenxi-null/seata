@@ -15,16 +15,22 @@
  */
 package io.seata.rm.datasource.exec;
 
-
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.Callable;
+import java.util.function.Function;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
 
+import io.seata.common.util.CollectionUtils;
 import io.seata.rm.datasource.AbstractConnectionProxy;
 import io.seata.rm.datasource.ConnectionContext;
 import io.seata.rm.datasource.ConnectionProxy;
 import io.seata.rm.datasource.StatementProxy;
+import io.seata.rm.datasource.exception.TableMetaException;
 import io.seata.rm.datasource.sql.struct.TableRecords;
 import io.seata.sqlparser.SQLRecognizer;
 import org.slf4j.Logger;
@@ -40,6 +46,11 @@ import org.slf4j.LoggerFactory;
 public abstract class AbstractDMLBaseExecutor<T, S extends Statement> extends BaseTransactionalExecutor<T, S> {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(AbstractDMLBaseExecutor.class);
+
+    protected static final String WHERE = " WHERE ";
+
+    protected static final String GROUP_BY = " GROUP BY ";
+
 
     /**
      * Instantiates a new Abstract dml base executor.
@@ -58,7 +69,7 @@ public abstract class AbstractDMLBaseExecutor<T, S extends Statement> extends Ba
      *
      * @param statementProxy    the statement proxy
      * @param statementCallback the statement callback
-     * @param sqlRecognizer     the multi sql recognizer
+     * @param sqlRecognizers    the multi sql recognizer
      */
     public AbstractDMLBaseExecutor(StatementProxy<S> statementProxy, StatementCallback<T, S> statementCallback,
                                    List<SQLRecognizer> sqlRecognizers) {
@@ -83,12 +94,41 @@ public abstract class AbstractDMLBaseExecutor<T, S extends Statement> extends Ba
      * @throws Exception the exception
      */
     protected T executeAutoCommitFalse(Object[] args) throws Exception {
-        TableRecords beforeImage = beforeImage();
-        T result = statementCallback.execute(statementProxy.getTargetStatement(), args);
-        TableRecords afterImage = afterImage(beforeImage);
-        prepareUndoLog(beforeImage, afterImage);
-        return result;
+        try {
+            TableRecords beforeImage = beforeImage();
+            T result = statementCallback.execute(statementProxy.getTargetStatement(), args);
+            TableRecords afterImage = afterImage(beforeImage);
+            prepareUndoLog(beforeImage, afterImage);
+            return result;
+        } catch (TableMetaException e) {
+            LOGGER.error("table meta will be refreshed later, due to TableMetaException, table:{}, column:{}",
+                e.getTableName(), e.getColumnName());
+            statementProxy.getConnectionProxy().getDataSourceProxy().tableMetaRefreshEvent();
+            throw e;
+        }
     }
+
+    private boolean isMultiPk() {
+        if (null != sqlRecognizer) {
+            return getTableMeta().getPrimaryKeyOnlyName().size() > 1;
+        }
+        if (CollectionUtils.isNotEmpty(sqlRecognizers)) {
+            List<SQLRecognizer> distinctSQLRecognizer = sqlRecognizers.stream().filter(
+                distinctByKey(t -> t.getTableName())).collect(Collectors.toList());
+            for (SQLRecognizer sqlRecognizer : distinctSQLRecognizer) {
+                if (getTableMeta(sqlRecognizer.getTableName()).getPrimaryKeyOnlyName().size() > 1) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static <T> Predicate<T> distinctByKey(Function<? super T, ?> keyExtractor) {
+        Map<Object, Boolean> map = new HashMap<>();
+        return t -> map.putIfAbsent(keyExtractor.apply(t), Boolean.TRUE) == null;
+    }
+
 
     /**
      * Execute auto commit true t.
@@ -100,7 +140,7 @@ public abstract class AbstractDMLBaseExecutor<T, S extends Statement> extends Ba
     protected T executeAutoCommitTrue(Object[] args) throws Throwable {
         ConnectionProxy connectionProxy = statementProxy.getConnectionProxy();
         try {
-            connectionProxy.setAutoCommit(false);
+            connectionProxy.changeAutoCommit();
             return new LockRetryPolicy(connectionProxy).execute(() -> {
                 T result = executeAutoCommitFalse(args);
                 connectionProxy.commit();
@@ -137,10 +177,9 @@ public abstract class AbstractDMLBaseExecutor<T, S extends Statement> extends Ba
     protected abstract TableRecords afterImage(TableRecords beforeImage) throws SQLException;
 
     private static class LockRetryPolicy extends ConnectionProxy.LockRetryPolicy {
-        private final ConnectionProxy connection;
 
         LockRetryPolicy(final ConnectionProxy connection) {
-            this.connection = connection;
+            super(connection);
         }
 
         @Override
@@ -156,8 +195,7 @@ public abstract class AbstractDMLBaseExecutor<T, S extends Statement> extends Ba
         protected void onException(Exception e) throws Exception {
             ConnectionContext context = connection.getContext();
             //UndoItems can't use the Set collection class to prevent ABA
-            context.getUndoItems().clear();
-            context.getLockKeysBuffer().clear();
+            context.removeSavepoint(null);
             connection.getTargetConnection().rollback();
         }
 

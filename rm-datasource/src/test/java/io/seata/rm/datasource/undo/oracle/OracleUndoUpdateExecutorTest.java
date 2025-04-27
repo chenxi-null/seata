@@ -16,17 +16,17 @@
 package io.seata.rm.datasource.undo.oracle;
 
 import io.seata.rm.datasource.sql.struct.Row;
-import io.seata.rm.datasource.sql.struct.TableMeta;
+import io.seata.sqlparser.struct.TableMeta;
 import io.seata.rm.datasource.sql.struct.TableRecords;
 import io.seata.rm.datasource.undo.BaseExecutorTest;
 import io.seata.rm.datasource.undo.SQLUndoLog;
 import io.seata.sqlparser.SQLType;
 import org.junit.jupiter.api.Assertions;
-import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 /**
@@ -54,7 +54,7 @@ public class OracleUndoUpdateExecutorTest extends BaseExecutorTest {
 
     private OracleUndoUpdateExecutor upperCaseSQL() {
         TableMeta tableMeta = Mockito.mock(TableMeta.class);
-        Mockito.when(tableMeta.getPkName()).thenReturn("ID");
+        Mockito.when(tableMeta.getPrimaryKeyOnlyName()).thenReturn(Arrays.asList(new String[]{"ID"}));
         Mockito.when(tableMeta.getTableName()).thenReturn("TABLE_NAME");
 
         TableRecords beforeImage = new TableRecords();

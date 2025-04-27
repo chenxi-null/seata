@@ -26,24 +26,31 @@ import java.util.Map;
 
 import io.seata.common.Constants;
 import io.seata.common.exception.FrameworkErrorCode;
+import io.seata.common.exception.StoreException;
+import io.seata.common.util.CollectionUtils;
 import io.seata.core.context.RootContext;
 import io.seata.core.exception.TransactionException;
 import io.seata.core.model.BranchStatus;
+import io.seata.core.model.BranchType;
 import io.seata.core.model.GlobalStatus;
 import io.seata.saga.engine.StateMachineConfig;
 import io.seata.saga.engine.config.DbStateMachineConfig;
 import io.seata.saga.engine.exception.EngineExecutionException;
+import io.seata.saga.engine.impl.DefaultStateMachineConfig;
+import io.seata.saga.engine.pcext.StateInstruction;
 import io.seata.saga.engine.pcext.utils.EngineUtils;
 import io.seata.saga.engine.sequence.SeqGenerator;
 import io.seata.saga.engine.serializer.Serializer;
 import io.seata.saga.engine.serializer.impl.ExceptionSerializer;
-import io.seata.saga.engine.serializer.impl.ParamsFastjsonSerializer;
+import io.seata.saga.engine.serializer.impl.ParamsSerializer;
 import io.seata.saga.engine.store.StateLogStore;
 import io.seata.saga.proctrl.ProcessContext;
 import io.seata.saga.statelang.domain.DomainConstants;
 import io.seata.saga.statelang.domain.ExecutionStatus;
 import io.seata.saga.statelang.domain.StateInstance;
+import io.seata.saga.statelang.domain.StateMachine;
 import io.seata.saga.statelang.domain.StateMachineInstance;
+import io.seata.saga.statelang.domain.impl.ServiceTaskStateImpl;
 import io.seata.saga.statelang.domain.impl.StateInstanceImpl;
 import io.seata.saga.statelang.domain.impl.StateMachineInstanceImpl;
 import io.seata.saga.tm.SagaTransactionalTemplate;
@@ -75,7 +82,7 @@ public class DbAndReportTcStateLogStore extends AbstractStore implements StateLo
                                                                                                = new StateInstanceToStatementForUpdate();
     private static final ResultSetToStateInstance                 RESULT_SET_TO_STATE_INSTANCE = new ResultSetToStateInstance();
     private SagaTransactionalTemplate sagaTransactionalTemplate;
-    private Serializer<Object, String>    paramsSerializer    = new ParamsFastjsonSerializer();
+    private Serializer<Object, String>    paramsSerializer    = new ParamsSerializer();
     private Serializer<Exception, byte[]> exceptionSerializer = new ExceptionSerializer();
     private StateLogStoreSqls stateLogStoreSqls;
     private String            defaultTenantId;
@@ -83,35 +90,41 @@ public class DbAndReportTcStateLogStore extends AbstractStore implements StateLo
 
     @Override
     public void recordStateMachineStarted(StateMachineInstance machineInstance, ProcessContext context) {
-
         if (machineInstance != null) {
             //if parentId is not null, machineInstance is a SubStateMachine, do not start a new global transaction,
             //use parent transaction instead.
             String parentId = machineInstance.getParentId();
-            if (StringUtils.hasLength(parentId)) {
-                if (StringUtils.isEmpty(machineInstance.getId())) {
-                    machineInstance.setId(parentId);
-                }
-            } else {
+            if (StringUtils.isEmpty(parentId)) {
                 beginTransaction(machineInstance, context);
             }
 
+            try {
+                if (StringUtils.isEmpty(machineInstance.getId()) && seqGenerator != null) {
+                    machineInstance.setId(seqGenerator.generate(DomainConstants.SEQ_ENTITY_STATE_MACHINE_INST));
+                }
 
-            if (StringUtils.isEmpty(machineInstance.getId()) && seqGenerator != null) {
-                machineInstance.setId(seqGenerator.generate(DomainConstants.SEQ_ENTITY_STATE_MACHINE_INST));
-            }
+                // bind SAGA branch type
+                RootContext.bindBranchType(BranchType.SAGA);
 
-            // save to db
-            machineInstance.setSerializedStartParams(paramsSerializer.serialize(machineInstance.getStartParams()));
-            executeUpdate(stateLogStoreSqls.getRecordStateMachineStartedSql(dbType),
+                // save to db
+                machineInstance.setSerializedStartParams(paramsSerializer.serialize(machineInstance.getStartParams()));
+                int effect = executeUpdate(stateLogStoreSqls.getRecordStateMachineStartedSql(dbType),
                     STATE_MACHINE_INSTANCE_TO_STATEMENT_FOR_INSERT, machineInstance);
+                if (effect < 1) {
+                    throw new StoreException("StateMachineInstance record start error, Xid: " + machineInstance.getId(),
+                        FrameworkErrorCode.OperationDenied);
+                }
+            } catch (StoreException e) {
+                LOGGER.error("Record statemachine start error: {}, StateMachine: {}, XID: {}, Reason: {}",
+                    e.getErrcode(), machineInstance.getStateMachine().getName(), machineInstance.getId(), e.getMessage(), e);
+                this.clearUp();
+                throw e;
+            }
         }
     }
 
     protected void beginTransaction(StateMachineInstance machineInstance, ProcessContext context) {
-
         if (sagaTransactionalTemplate != null) {
-
             StateMachineConfig stateMachineConfig = (StateMachineConfig) context.getVariable(
                     DomainConstants.VAR_NAME_STATEMACHINE_CONFIG);
             TransactionInfo transactionInfo = new TransactionInfo();
@@ -126,9 +139,7 @@ public class DbAndReportTcStateLogStore extends AbstractStore implements StateLo
                 if (machineContext != null) {
                     machineContext.put(DomainConstants.VAR_NAME_GLOBAL_TX, globalTransaction);
                 }
-
             } catch (ExecutionException e) {
-
                 String xid = null;
                 if (e.getTransaction() != null) {
                     xid = e.getTransaction().getXid();
@@ -140,6 +151,7 @@ public class DbAndReportTcStateLogStore extends AbstractStore implements StateLo
             finally {
                 if (Boolean.TRUE.equals(context.getVariable(DomainConstants.VAR_NAME_IS_ASYNC_EXECUTION))) {
                     RootContext.unbind();
+                    RootContext.unbindBranchType();
                 }
             }
         }
@@ -147,42 +159,48 @@ public class DbAndReportTcStateLogStore extends AbstractStore implements StateLo
 
     @Override
     public void recordStateMachineFinished(StateMachineInstance machineInstance, ProcessContext context) {
-
         if (machineInstance != null) {
-            // save to db
-            Map<String, Object> endParams = machineInstance.getEndParams();
-            if (endParams != null) {
-                endParams.remove(DomainConstants.VAR_NAME_GLOBAL_TX);
-            }
-
-            machineInstance.setSerializedEndParams(paramsSerializer.serialize(machineInstance.getEndParams()));
-            machineInstance.setSerializedException(exceptionSerializer.serialize(machineInstance.getException()));
-            int effect = executeUpdate(stateLogStoreSqls.getRecordStateMachineFinishedSql(dbType),
-                    STATE_MACHINE_INSTANCE_TO_STATEMENT_FOR_UPDATE, machineInstance);
-            if (effect < 1) {
-                LOGGER.warn("StateMachineInstance[{}] is recovery by server, skip recordStateMachineFinished.", machineInstance.getId());
-            } else {
-                StateMachineConfig stateMachineConfig = (StateMachineConfig) context.getVariable(
-                        DomainConstants.VAR_NAME_STATEMACHINE_CONFIG);
-                if (EngineUtils.isTimeout(machineInstance.getGmtUpdated(), stateMachineConfig.getTransOperationTimeout())) {
-                    LOGGER.warn("StateMachineInstance[{}] is execution timeout, skip report transaction finished to server.", machineInstance.getId());
-                } else if (StringUtils.isEmpty(machineInstance.getParentId())) {
-                    //if parentId is not null, machineInstance is a SubStateMachine, do not report global transaction.
-                    reportTransactionFinished(machineInstance, context);
+            try {
+                // save to db
+                Map<String, Object> endParams = machineInstance.getEndParams();
+                if (endParams != null) {
+                    endParams.remove(DomainConstants.VAR_NAME_GLOBAL_TX);
                 }
+
+                // if success, clear exception
+                if (ExecutionStatus.SU.equals(machineInstance.getStatus()) && machineInstance.getException() != null) {
+                    machineInstance.setException(null);
+                }
+
+                machineInstance.setSerializedEndParams(paramsSerializer.serialize(machineInstance.getEndParams()));
+                machineInstance.setSerializedException(exceptionSerializer.serialize(machineInstance.getException()));
+                int effect = executeUpdate(stateLogStoreSqls.getRecordStateMachineFinishedSql(dbType),
+                        STATE_MACHINE_INSTANCE_TO_STATEMENT_FOR_UPDATE, machineInstance);
+                if (effect < 1) {
+                    LOGGER.warn("StateMachineInstance[{}] is recovery by server, skip recordStateMachineFinished.", machineInstance.getId());
+                } else {
+                    StateMachineConfig stateMachineConfig = (StateMachineConfig) context.getVariable(
+                            DomainConstants.VAR_NAME_STATEMACHINE_CONFIG);
+                    if (EngineUtils.isTimeout(machineInstance.getGmtUpdated(), stateMachineConfig.getTransOperationTimeout())) {
+                        LOGGER.warn("StateMachineInstance[{}] is execution timeout, skip report transaction finished to server.", machineInstance.getId());
+                    } else if (StringUtils.isEmpty(machineInstance.getParentId())) {
+                        //if parentId is not null, machineInstance is a SubStateMachine, do not report global transaction.
+                        reportTransactionFinished(machineInstance, context);
+                    }
+                }
+            } finally {
+                RootContext.unbind();
+                RootContext.unbindBranchType();
             }
-            RootContext.unbind();
         }
     }
 
     protected void reportTransactionFinished(StateMachineInstance machineInstance, ProcessContext context) {
-
         if (sagaTransactionalTemplate != null) {
-
+            GlobalTransaction globalTransaction = null;
             try {
-                GlobalTransaction globalTransaction = getGlobalTransaction(machineInstance, context);
+                globalTransaction = getGlobalTransaction(machineInstance, context);
                 if (globalTransaction == null) {
-
                     throw new EngineExecutionException("Global transaction is not exists",
                             FrameworkErrorCode.ObjectNotExists);
                 }
@@ -207,18 +225,16 @@ public class DbAndReportTcStateLogStore extends AbstractStore implements StateLo
                 }
                 sagaTransactionalTemplate.reportTransaction(globalTransaction, globalStatus);
             } catch (ExecutionException e) {
-                LOGGER.error("Report transaction finish to server error: ",
-                        e.getCode() + ", StateMachine:" + machineInstance.getStateMachine().getName() + ", XID: "
-                                + machineInstance.getId() + ", Reason: " + e.getMessage(), e);
+                LOGGER.error("Report transaction finish to server error: {}, StateMachine: {}, XID: {}, Reason: {}",
+                    e.getCode(), machineInstance.getStateMachine().getName(), machineInstance.getId(), e.getMessage(), e);
             } catch (TransactionException e) {
-                LOGGER.error(
-                        "Report transaction finish to server error: " + e.getCode() + ", StateMachine:" + machineInstance
-                                .getStateMachine().getName() + ", XID: " + machineInstance.getId() + ", Reason: " + e
-                                .getMessage(), e);
+                LOGGER.error("Report transaction finish to server error: {}, StateMachine: {}, XID: {}, Reason: {}",
+                    e.getCode(), machineInstance.getStateMachine().getName(), machineInstance.getId(), e.getMessage(), e);
             } finally {
                 // clear
                 RootContext.unbind();
-                sagaTransactionalTemplate.triggerAfterCompletion();
+                RootContext.unbindBranchType();
+                sagaTransactionalTemplate.triggerAfterCompletion(globalTransaction);
                 sagaTransactionalTemplate.cleanUp();
             }
         }
@@ -242,38 +258,45 @@ public class DbAndReportTcStateLogStore extends AbstractStore implements StateLo
 
     @Override
     public void recordStateStarted(StateInstance stateInstance, ProcessContext context) {
-
         if (stateInstance != null) {
 
-            //if this state is for retry, do not register branch, but generate id
+            boolean isUpdateMode = isUpdateMode(stateInstance, context);
+
+            // if this state is for retry, do not register branch
             if (StringUtils.hasLength(stateInstance.getStateIdRetriedFor())) {
-
-                stateInstance.setId(generateRetryStateInstanceId(stateInstance));
+                if (isUpdateMode) {
+                    stateInstance.setId(stateInstance.getStateIdRetriedFor());
+                } else {
+                    // generate id by default
+                    stateInstance.setId(generateRetryStateInstanceId(stateInstance));
+                }
             }
-            //if this state is for compensation, do not register branch, but generate id
+            // if this state is for compensation, do not register branch
             else if (StringUtils.hasLength(stateInstance.getStateIdCompensatedFor())) {
-
-                stateInstance.setId(generateCompensateStateInstanceId(stateInstance));
-            }
-            else {
+                stateInstance.setId(generateCompensateStateInstanceId(stateInstance, isUpdateMode));
+            } else {
                 branchRegister(stateInstance, context);
             }
-
 
             if (StringUtils.isEmpty(stateInstance.getId()) && seqGenerator != null) {
                 stateInstance.setId(seqGenerator.generate(DomainConstants.SEQ_ENTITY_STATE_INST));
             }
 
             stateInstance.setSerializedInputParams(paramsSerializer.serialize(stateInstance.getInputParams()));
-            executeUpdate(stateLogStoreSqls.getRecordStateStartedSql(dbType), STATE_INSTANCE_TO_STATEMENT_FOR_INSERT,
-                    stateInstance);
+            if (!isUpdateMode) {
+                executeUpdate(stateLogStoreSqls.getRecordStateStartedSql(dbType),
+                    STATE_INSTANCE_TO_STATEMENT_FOR_INSERT, stateInstance);
+            } else {
+                // if this retry/compensate state do not need persist, just update last inst
+                executeUpdate(stateLogStoreSqls.getUpdateStateExecutionStatusSql(dbType),
+                    stateInstance.getStatus().name(), new Timestamp(System.currentTimeMillis()),
+                    stateInstance.getMachineInstanceId(), stateInstance.getId());
+            }
         }
     }
 
     protected void branchRegister(StateInstance stateInstance, ProcessContext context) {
-
         if (sagaTransactionalTemplate != null) {
-
             StateMachineConfig stateMachineConfig = (StateMachineConfig) context.getVariable(
                     DomainConstants.VAR_NAME_STATEMACHINE_CONFIG);
 
@@ -314,7 +337,6 @@ public class DbAndReportTcStateLogStore extends AbstractStore implements StateLo
 
     protected GlobalTransaction getGlobalTransaction(StateMachineInstance machineInstance, ProcessContext context)
             throws ExecutionException, TransactionException {
-
         GlobalTransaction globalTransaction = (GlobalTransaction) context.getVariable(DomainConstants.VAR_NAME_GLOBAL_TX);
         if (globalTransaction == null) {
             String xid;
@@ -339,7 +361,6 @@ public class DbAndReportTcStateLogStore extends AbstractStore implements StateLo
      * @return
      */
     private String generateRetryStateInstanceId(StateInstance stateInstance) {
-
         String originalStateInstId = stateInstance.getStateIdRetriedFor();
         int maxIndex = 1;
         Map<String, StateInstance> stateInstanceMap = stateInstance.getStateMachineInstance().getStateMap();
@@ -362,11 +383,16 @@ public class DbAndReportTcStateLogStore extends AbstractStore implements StateLo
      * @param stateInstance
      * @return
      */
-    private String generateCompensateStateInstanceId(StateInstance stateInstance) {
-
+    private String generateCompensateStateInstanceId(StateInstance stateInstance, boolean isUpdateMode) {
         String originalCompensateStateInstId = stateInstance.getStateIdCompensatedFor();
         int maxIndex = 1;
-        for (StateInstance aStateInstance : stateInstance.getStateMachineInstance().getStateList()) {
+        // if update mode, means update last compensate inst
+        if (isUpdateMode) {
+            return originalCompensateStateInstId + "-" + maxIndex;
+        }
+
+        for (int i = 0; i < stateInstance.getStateMachineInstance().getStateList().size(); i++) {
+            StateInstance aStateInstance = stateInstance.getStateMachineInstance().getStateList().get(i);
             if (aStateInstance != stateInstance
                     && originalCompensateStateInstId.equals(aStateInstance.getStateIdCompensatedFor())) {
                 int idIndex = getIdIndex(aStateInstance.getId(), "-");
@@ -378,11 +404,10 @@ public class DbAndReportTcStateLogStore extends AbstractStore implements StateLo
     }
 
     private int getIdIndex(String stateInstanceId, String separator) {
-
         if (StringUtils.hasLength(stateInstanceId)) {
             int start = stateInstanceId.lastIndexOf(separator);
             if (start > 0) {
-                String indexStr = stateInstanceId.substring(start + 1, stateInstanceId.length());
+                String indexStr = stateInstanceId.substring(start + 1);
                 try {
                     return Integer.parseInt(indexStr);
                 } catch (NumberFormatException e) {
@@ -393,9 +418,43 @@ public class DbAndReportTcStateLogStore extends AbstractStore implements StateLo
         return -1;
     }
 
+    private boolean isUpdateMode(StateInstance stateInstance, ProcessContext context) {
+        DefaultStateMachineConfig stateMachineConfig = (DefaultStateMachineConfig)context.getVariable(
+            DomainConstants.VAR_NAME_STATEMACHINE_CONFIG);
+        StateInstruction instruction = context.getInstruction(StateInstruction.class);
+        ServiceTaskStateImpl state = (ServiceTaskStateImpl)instruction.getState(context);
+        StateMachine stateMachine = stateInstance.getStateMachineInstance().getStateMachine();
+
+        if (StringUtils.hasLength(stateInstance.getStateIdRetriedFor())) {
+
+            if (null != state.isRetryPersistModeUpdate()) {
+                return state.isRetryPersistModeUpdate();
+            } else if (null != stateMachine.isRetryPersistModeUpdate()) {
+                return stateMachine.isRetryPersistModeUpdate();
+            }
+            return stateMachineConfig.isSagaRetryPersistModeUpdate();
+
+        } else if (StringUtils.hasLength(stateInstance.getStateIdCompensatedFor())) {
+
+            // find if this compensate has been executed
+            for (int i = 0; i < stateInstance.getStateMachineInstance().getStateList().size(); i++) {
+                StateInstance aStateInstance = stateInstance.getStateMachineInstance().getStateList().get(i);
+                if (aStateInstance.isForCompensation() && aStateInstance.getName().equals(stateInstance.getName())) {
+                    if (null != state.isCompensatePersistModeUpdate()) {
+                        return state.isCompensatePersistModeUpdate();
+                    } else if (null != stateMachine.isCompensatePersistModeUpdate()) {
+                        return stateMachine.isCompensatePersistModeUpdate();
+                    }
+                    return stateMachineConfig.isSagaCompensatePersistModeUpdate();
+                }
+            }
+            return false;
+        }
+        return false;
+    }
+
     @Override
     public void recordStateFinished(StateInstance stateInstance, ProcessContext context) {
-
         if (stateInstance != null) {
 
             stateInstance.setSerializedOutputParams(paramsSerializer.serialize(stateInstance.getOutputParams()));
@@ -415,9 +474,7 @@ public class DbAndReportTcStateLogStore extends AbstractStore implements StateLo
     }
 
     protected void branchReport(StateInstance stateInstance, ProcessContext context) {
-
         if (sagaTransactionalTemplate != null) {
-
             StateMachineConfig stateMachineConfig = (StateMachineConfig) context.getVariable(
                     DomainConstants.VAR_NAME_STATEMACHINE_CONFIG);
 
@@ -435,7 +492,11 @@ public class DbAndReportTcStateLogStore extends AbstractStore implements StateLo
             StateInstance originalStateInst = null;
             if (StringUtils.hasLength(stateInstance.getStateIdRetriedFor())) {
 
-                originalStateInst = findOutOriginalStateInstanceOfRetryState(stateInstance);
+                if (isUpdateMode(stateInstance, context)) {
+                    originalStateInst = stateInstance;
+                } else {
+                    originalStateInst = findOutOriginalStateInstanceOfRetryState(stateInstance);
+                }
 
                 if (ExecutionStatus.SU.equals(stateInstance.getStatus())) {
                     branchStatus = BranchStatus.PhaseTwo_Committed;
@@ -448,7 +509,12 @@ public class DbAndReportTcStateLogStore extends AbstractStore implements StateLo
 
             } else if (StringUtils.hasLength(stateInstance.getStateIdCompensatedFor())) {
 
-                originalStateInst = findOutOriginalStateInstanceOfCompensateState(stateInstance);
+                if (isUpdateMode(stateInstance, context)) {
+                    originalStateInst = stateInstance.getStateMachineInstance().getStateMap().get(
+                        stateInstance.getStateIdCompensatedFor());
+                } else {
+                    originalStateInst = findOutOriginalStateInstanceOfCompensateState(stateInstance);
+                }
             }
 
             if (originalStateInst == null) {
@@ -511,7 +577,6 @@ public class DbAndReportTcStateLogStore extends AbstractStore implements StateLo
     }
 
     private StateInstance findOutOriginalStateInstanceOfRetryState(StateInstance stateInstance) {
-
         StateInstance originalStateInst;
         Map<String, StateInstance> stateInstanceMap = stateInstance.getStateMachineInstance().getStateMap();
         originalStateInst = stateInstanceMap.get(stateInstance.getStateIdRetriedFor());
@@ -522,7 +587,6 @@ public class DbAndReportTcStateLogStore extends AbstractStore implements StateLo
     }
 
     private StateInstance findOutOriginalStateInstanceOfCompensateState(StateInstance stateInstance) {
-
         StateInstance originalStateInst;
         Map<String, StateInstance> stateInstanceMap = stateInstance.getStateMachineInstance().getStateMap();
         originalStateInst = stateInstance.getStateMachineInstance().getStateMap().get(stateInstance.getStateIdCompensatedFor());
@@ -534,7 +598,6 @@ public class DbAndReportTcStateLogStore extends AbstractStore implements StateLo
 
     @Override
     public StateMachineInstance getStateMachineInstance(String stateMachineInstanceId) {
-
         StateMachineInstance stateMachineInstance = selectOne(stateLogStoreSqls.getGetStateMachineInstanceByIdSql(dbType),
                 RESULT_SET_TO_STATE_MACHINE_INSTANCE, stateMachineInstanceId);
         if (stateMachineInstance == null) {
@@ -551,7 +614,6 @@ public class DbAndReportTcStateLogStore extends AbstractStore implements StateLo
 
     @Override
     public StateMachineInstance getStateMachineInstanceByBusinessKey(String businessKey, String tenantId) {
-
         if (StringUtils.isEmpty(tenantId)) {
             tenantId = defaultTenantId;
         }
@@ -573,7 +635,7 @@ public class DbAndReportTcStateLogStore extends AbstractStore implements StateLo
     private void deserializeParamsAndException(StateMachineInstance stateMachineInstance) {
         byte[] serializedException = (byte[]) stateMachineInstance.getSerializedException();
         if (serializedException != null) {
-            stateMachineInstance.setException((Exception) exceptionSerializer.deserialize(serializedException));
+            stateMachineInstance.setException(exceptionSerializer.deserialize(serializedException));
         }
 
         String serializedStartParams = (String) stateMachineInstance.getSerializedStartParams();
@@ -596,7 +658,6 @@ public class DbAndReportTcStateLogStore extends AbstractStore implements StateLo
 
     @Override
     public StateInstance getStateInstance(String stateInstanceId, String machineInstId) {
-
         StateInstance stateInstance = selectOne(
                 stateLogStoreSqls.getGetStateInstanceByIdAndMachineInstanceIdSql(dbType), RESULT_SET_TO_STATE_INSTANCE,
                 machineInstId, stateInstanceId);
@@ -616,31 +677,28 @@ public class DbAndReportTcStateLogStore extends AbstractStore implements StateLo
             }
             byte[] serializedException = (byte[]) stateInstance.getSerializedException();
             if (serializedException != null) {
-                stateInstance.setException((Exception) exceptionSerializer.deserialize(serializedException));
+                stateInstance.setException(exceptionSerializer.deserialize(serializedException));
             }
         }
     }
 
     @Override
     public List<StateInstance> queryStateInstanceListByMachineInstanceId(String stateMachineInstanceId) {
-
         List<StateInstance> stateInstanceList = selectList(
                 stateLogStoreSqls.getQueryStateInstancesByMachineInstanceIdSql(dbType), RESULT_SET_TO_STATE_INSTANCE,
                 stateMachineInstanceId);
 
-        if (stateInstanceList == null || stateInstanceList.size() == 0) {
+        if (CollectionUtils.isEmpty(stateInstanceList)) {
             return stateInstanceList;
         }
-        StateInstance lastStateInstance = stateInstanceList.get(stateInstanceList.size() - 1);
+        StateInstance lastStateInstance = CollectionUtils.getLast(stateInstanceList);
         if (lastStateInstance.getGmtEnd() == null) {
             lastStateInstance.setStatus(ExecutionStatus.RU);
         }
         Map<String, StateInstance> originStateMap = new HashMap<>();
         Map<String/* originStateId */, StateInstance/* compensatedState */> compensatedStateMap = new HashMap<>();
         Map<String/* originStateId */, StateInstance/* retriedState */> retriedStateMap = new HashMap<>();
-        for (int i = 0; i < stateInstanceList.size(); i++) {
-            StateInstance tempStateInstance = stateInstanceList.get(i);
-
+        for (StateInstance tempStateInstance : stateInstanceList) {
             deserializeParamsAndException(tempStateInstance);
 
             if (StringUtils.hasText(tempStateInstance.getStateIdCompensatedFor())) {
@@ -669,19 +727,24 @@ public class DbAndReportTcStateLogStore extends AbstractStore implements StateLo
         return stateInstanceList;
     }
 
+    @Override
+    public void clearUp() {
+        RootContext.unbind();
+        RootContext.unbindBranchType();
+        if (sagaTransactionalTemplate != null) {
+            sagaTransactionalTemplate.cleanUp();
+        }
+    }
+
     private void putLastStateToMap(Map<String, StateInstance> resultMap, StateInstance newState, String key) {
-
         if (!resultMap.containsKey(key)) {
-
             resultMap.put(key, newState);
         } else if (newState.getGmtEnd().after(resultMap.get(key).getGmtEnd())) {
-
             StateInstance oldState = resultMap.remove(key);
             oldState.setIgnoreStatus(true);
 
             resultMap.put(key, newState);
         } else {
-
             newState.setIgnoreStatus(true);
         }
     }
@@ -777,6 +840,7 @@ public class DbAndReportTcStateLogStore extends AbstractStore implements StateLo
             statement.setString(12, stateInstance.getBusinessKey());
             statement.setString(13, stateInstance.getStateIdCompensatedFor());
             statement.setString(14, stateInstance.getStateIdRetriedFor());
+            statement.setTimestamp(15, new Timestamp(stateInstance.getGmtUpdated().getTime()));
         }
     }
 
@@ -788,15 +852,15 @@ public class DbAndReportTcStateLogStore extends AbstractStore implements StateLo
                     stateInstance.getException() != null ? (byte[]) stateInstance.getSerializedException() : null);
             statement.setString(3, stateInstance.getStatus().name());
             statement.setObject(4, stateInstance.getSerializedOutputParams());
-            statement.setString(5, stateInstance.getId());
-            statement.setString(6, stateInstance.getMachineInstanceId());
+            statement.setTimestamp(5, new Timestamp(stateInstance.getGmtEnd().getTime()));
+            statement.setString(6, stateInstance.getId());
+            statement.setString(7, stateInstance.getMachineInstanceId());
         }
     }
 
     private static class ResultSetToStateMachineInstance implements ResultSetToObject<StateMachineInstance> {
         @Override
         public StateMachineInstance toObject(ResultSet resultSet) throws SQLException {
-
             StateMachineInstanceImpl stateMachineInstance = new StateMachineInstanceImpl();
             stateMachineInstance.setId(resultSet.getString("id"));
             stateMachineInstance.setMachineId(resultSet.getString("machine_id"));
@@ -826,7 +890,6 @@ public class DbAndReportTcStateLogStore extends AbstractStore implements StateLo
     private static class ResultSetToStateInstance implements ResultSetToObject<StateInstance> {
         @Override
         public StateInstance toObject(ResultSet resultSet) throws SQLException {
-
             StateInstanceImpl stateInstance = new StateInstanceImpl();
             stateInstance.setId(resultSet.getString("id"));
             stateInstance.setMachineInstanceId(resultSet.getString("machine_inst_id"));

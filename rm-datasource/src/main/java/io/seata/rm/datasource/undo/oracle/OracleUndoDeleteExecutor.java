@@ -17,7 +17,7 @@ package io.seata.rm.datasource.undo.oracle;
 
 import io.seata.common.exception.ShouldNeverHappenException;
 import io.seata.common.util.CollectionUtils;
-import io.seata.rm.datasource.ColumnUtils;
+import io.seata.sqlparser.util.ColumnUtils;
 import io.seata.rm.datasource.sql.struct.Field;
 import io.seata.rm.datasource.sql.struct.Row;
 import io.seata.rm.datasource.sql.struct.TableRecords;
@@ -59,9 +59,7 @@ public class OracleUndoDeleteExecutor extends AbstractUndoExecutor {
         }
         Row row = beforeImageRows.get(0);
         List<Field> fields = new ArrayList<>(row.nonPrimaryKeys());
-        Field pkField = row.primaryKeys().get(0);
-        // PK is at last one.
-        fields.add(pkField);
+        fields.addAll(getOrderedPkList(beforeImage,row,JdbcConstants.ORACLE));
 
         // delete sql undo log before image all field come from table meta, need add escape.
         // see BaseTransactionalExecutor#buildTableRecords
